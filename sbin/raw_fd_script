@@ -1,0 +1,163 @@
+#!/usr/bin/perl
+
+#
+# NetUP UTM5 raw-log script parser (like get_nf_direct tool)
+#
+# Author: "Vladislav Muschinskikh" <ya@unixoid.su>
+#
+# Thanks to Magnum72
+#
+
+use DBI;
+use IO::File;
+use IO::Compress::Gzip;
+use Config::IniFiles;
+use Class::Date;
+use strict;
+
+my $datadir = '/var/flowstat';
+
+my $log = IO::File->new('/var/log/fd.log','a') or die('Unable to open/create log-file!');
+
+my $cfg = Config::IniFiles->new(-file=>'/netup/utm5/utm5.cfg',-fallback=>'main') or do{ print $log "Unable to load UTM config\n"; die(); };
+my $dbh = DBI->connect(sprintf('dbi:%s:%s',$cfg->val('main','database_type'),$cfg->val('main','database_optional')),$cfg->val('main','database_login'),$cfg->val('main','database_password')) or do{ print $log "Unable to connect DB!\n"; die(); };
+my %traf;
+
+printf $log "[%s] [!] PID %d started...\n", (Class::Date->new(time())), $$;
+
+if ( !-d($datadir) )
+{
+    printf $log "[%s] [>] Creating data-dir \'%s\'...\n", (Class::Date->new(time())), $datadir;
+    mkdir($datadir,0755) or do{ printf $log "Failed! Error %d, exiting...\n", $!; die($!); };
+}
+
+# 1. Processing UTM RAW file(s)
+
+foreach my $utmLogFile ( @ARGV )
+{
+    if ( -s($utmLogFile)%76 == 0 )
+    {
+	my $raw = IO::File->new($utmLogFile) or printf $log 'Unable to fopen() UTM data-file \'%s\'', $utmLogFile;
+	my $i;
+
+	my $start = time();
+
+	printf $log "[%s] [<] Processing %s...\n", (Class::Date->new(time())), $utmLogFile;
+
+	until ( $raw->eof() )
+	{
+	    $raw->read( undef, 4 );		# 1-4
+	    $raw->read( my $src_ip, 4 );	# 5-8
+	    $raw->read( my $dst_ip, 4 );	# 9-12
+	    $raw->read( undef, 8 );		# 13-20
+	    $raw->read( my $packets,4 );	# 21-24
+	    $raw->read( my $bytes,  4 );	# 25-28
+	    $raw->read( undef, 4 );		# 29-32
+	    $raw->read( undef, 4 );		# 33-36
+	    $raw->read( my $src_p,  2 );	# 37-38
+	    $raw->read( my $dst_p,  2 );	# 39-40
+	    $raw->read( undef, 16);		# 41-56
+	    $raw->read( my $acc_id, 4 );	# 57-60
+	    $raw->read( undef, 4 );		# 61-64
+	    $raw->read( my $tclass, 4 );	# 65-68
+	    $raw->read( my $tstamp, 4 );	# 69-72
+	    $raw->read( undef, 4 );		# 73-76
+
+	    my $ts    = Class::Date->new(unpack('%32I',$tstamp));
+	    my $month = $ts->strftime('%Y%m');
+	    my $date = $ts->strftime('%Y-%m-%d');
+
+	    $acc_id   = unpack('%32I',$acc_id);
+	    $tclass   = unpack('%32I',$tclass);
+
+	    if ( $tclass == 0 )
+	    {
+		$acc_id = 'NULL';
+	    }
+
+#                     26 =                   4        4         4       4       2       2                  2        4
+	    if ( my $rec = join(undef, $src_ip, $dst_ip, $packets, $bytes, $src_p, $dst_p, pack('S',$tclass), $tstamp) )
+	    {
+		push @{$traf{'monthly'}->{$month}->{$acc_id}}, $rec if ( length($rec) == 26 );
+	    }
+
+	    $i++;
+
+	    $src_ip = unpack("%32l" ,$src_ip);
+	    $dst_ip = unpack("%32l" ,$dst_ip);
+
+	    $traf{'daily'}->{$date}->{$acc_id}->{$dst_ip}->{packets} += unpack('%32I',$packets);
+	    $traf{'daily'}->{$date}->{$acc_id}->{$dst_ip}->{bytes}   += unpack('%32I',$bytes);
+	}
+
+	$raw->close();
+
+	printf $log "[%s] [!] Records completed: %d in %d seconds\n", (Class::Date->new(time())), $i, (time()-$start);
+    }
+    else
+    {
+	printf $log "[%s] [E] Log-file '%s' has incorrect format!\n", (Class::Date->new(time())), $utmLogFile;
+    }
+}
+
+# 2. Writing optimized GZipped DS-files into data-dir
+printf $log "[%s] [>] Saving traffic log into gzipped binary DS-files...\n", (Class::Date->new(time()));
+
+foreach my $period ( sort keys %{$traf{'monthly'}} )
+{
+    my $path = sprintf '%s/%s', $datadir, $period;
+
+    if ( !-d($path) )
+    {
+	printf $log "[%s] [>] Creating data-dir \'%s\'...\n", (Class::Date->new(time())), $path;
+	mkdir($path,0755) or do{ printf $log "Failed! Error %d, exiting...\n", $!; die($!); };
+    }
+
+    foreach my $acc_id ( sort keys %{$traf{'monthly'}->{$period}} )
+    {
+	my $out = IO::Compress::Gzip->new(sprintf('%s/%s.ds.gz',$path,$acc_id),Append=>1);
+
+	foreach my $rec ( @{$traf{'monthly'}->{$period}->{$acc_id}} )
+	{
+	    $out->write($rec);
+	}
+
+	$out->close();
+    }
+}
+
+# 3. Writing daily user statistics into database
+printf $log "[%s] [>] Saving traffic into DB......\n", (Class::Date->new(time()));
+
+my $start = time();
+my $i;
+
+foreach my $d ( sort keys %{$traf{'daily'}} )
+{
+    foreach my $a ( sort keys %{$traf{'daily'}->{$d}} )
+    {
+	foreach my $ip ( sort keys %{$traf{'daily'}->{$d}->{$a}} )
+	{
+	    $i++;
+	    my $query = sprintf 'INSERT INTO `stat__daily` (`date`,`ip`,`utm_account_id`,`packets`,`bytes`)'
+				.' VALUES (\'%s\',%d,%s,%d,%d)'
+				.' ON DUPLICATE KEY'
+				.' UPDATE `utm_account_id`=%3$s,'
+				    .'`packets`=`packets`+%4$d,'
+				    .'`bytes`=`bytes`+%5$d;',
+				$d,
+				$ip,
+				$a,
+				$traf{'daily'}->{$d}->{$a}->{$ip}->{packets},
+				$traf{'daily'}->{$d}->{$a}->{$ip}->{bytes};
+
+	    $dbh->do($query);
+	    $dbh->do(sprintf('UPDATE `stat__daily` SET `utm_account_id`=%d WHERE `ip`=%d `utm_account_id` IS NULL AND `date`>=\'2011-01-01\'',$a,$ip)) if ($a ne 'NULL');
+	}
+    }
+}
+
+printf $log "[%s] [!] DB queries completed: %d in %d seconds\n", (Class::Date->new(time())), $i, (time()-$start);
+printf $log "[%s] [!] PID %d completed...\n--\n", (Class::Date->new(time())), $$;
+
+$log->close();
